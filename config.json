@@ -1,5 +1,6 @@
 {
-  "token": "change-me-shared-secret",
+  "token": "",
+  "bootstrapToken": "change-me-bootstrap-secret",
   "openclawHome": "/home/admin",
   "openclawCronsPath": "/home/admin/.openclaw/cron/jobs.json",
   "workspaceRoot": "/home/admin/.openclaw/workspace",

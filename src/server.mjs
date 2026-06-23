@@ -11,6 +11,7 @@ function loadConfig() {
   if (!existsSync(CONFIG_PATH)) {
     return {
       token: process.env.EAG_TOKEN || '',
+      bootstrapToken: process.env.EAG_BOOTSTRAP_TOKEN || '',
       openclawHome: '/home/admin',
       openclawCronsPath: '/home/admin/.openclaw/cron/jobs.json',
       workspaceRoot: '/home/admin/.openclaw/workspace',
@@ -19,7 +20,12 @@ function loadConfig() {
       cronJobs: {}
     };
   }
-  return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
+  const data = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
+  // 兼容：早期 config.json 没有 bootstrapToken 字段
+  if (typeof data.bootstrapToken === 'undefined') {
+    data.bootstrapToken = process.env.EAG_BOOTSTRAP_TOKEN || '';
+  }
+  return data;
 }
 
 let config = loadConfig();
@@ -34,7 +40,17 @@ app.use(express.json({ limit: '5mb' }));
 
 function auth(req, res, next) {
   const a = req.get('authorization') || '';
-  if (!config.token || a === `Bearer ${config.token}`) return next();
+  const provided = a.replace(/^Bearer\s+/i, '');
+
+  // 优先：长期 token
+  if (config.token && provided === config.token) return next();
+
+  // 备选：bootstrap token（仅用于首次部署，安装时一次性使用）
+  if (config.bootstrapToken && provided === config.bootstrapToken) {
+    req._viaBootstrap = true;
+    return next();
+  }
+
   return res.status(401).json({ ok: false, error: 'unauthorized' });
 }
 
@@ -43,8 +59,10 @@ app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'expert-agent-gateway',
+    version: '1.0.0',
     experts: Object.keys(config.cronJobs || {}),
-    version: '1.0.0'
+    needsBootstrap: !config.token,  // 是否需要首次部署（token 还没设置）
+    hasBootstrapToken: !!config.bootstrapToken,
   });
 });
 
@@ -116,9 +134,14 @@ app.delete('/api/config/cron-jobs/:expertId', auth, (req, res) => {
 
 // 安装 cron job 到 OpenClaw（追加到 jobs.json）
 app.post('/api/admin/install-cron', auth, (req, res) => {
-  const { cronJob } = req.body || {};
+  const { cronJob, setToken } = req.body || {};
   if (!cronJob || !cronJob.id || !cronJob.name || !cronJob.agentId) {
     return res.status(400).json({ ok: false, error: 'cronJob { id, name, agentId } required' });
+  }
+
+  // 首次部署：使用 bootstrap 调用，可顺便设置长期 token
+  if (req._viaBootstrap && setToken) {
+    config.token = String(setToken);
   }
 
   const cronsPath = config.openclawCronsPath
