@@ -1,0 +1,9 @@
+{
+  "token": "change-me-shared-secret",
+  "openclawHome": "/home/admin",
+  "openclawCronsPath": "/home/admin/.openclaw/cron/jobs.json",
+  "workspaceRoot": "/home/admin/.openclaw/workspace",
+  "asyncTimeoutMs": 15000,
+  "waitTimeoutMs": 600000,
+  "cronJobs": {}
+}

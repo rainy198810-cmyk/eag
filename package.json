@@ -1,0 +1,13 @@
+{
+  "name": "expert-agent-gateway",
+  "version": "1.0.0",
+  "description": "Expert Agent Gateway (EAG) - 接收 PMS 触发请求并调用本机 OpenClaw cron",
+  "main": "src/server.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
