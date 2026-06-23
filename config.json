@@ -1,4 +1,5 @@
 {
+  "_comment": "PORT 默认 1688，可通过 EAG_PORT 环境变量覆盖；token 由 PMS 首次部署时自动生成",
   "token": "",
   "bootstrapToken": "change-me-bootstrap-secret",
   "openclawHome": "/home/admin",

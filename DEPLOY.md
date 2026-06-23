@@ -1,163 +1,97 @@
-# Expert Agent Gateway (EAG) 部署指南
+# EAG 部署指南
+
+> EAG = Expert Agent Gateway，部署在每台新专家服务器上，作为 PMS 与本机 OpenClaw Agent 之间的桥梁。
+>
+> 端口：**1688**（可在 systemd 配置中通过 `EAG_PORT` 覆盖）
 
 ## 一、整体架构
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                       主 PMS 服务器                              │
-│  - 批次管理、发稿任务、专家分配                                   │
-│  - 后台「远程专家部署 (EAG)」面板                                 │
-└────────────────────────────────────────────────────────────────┘
-                            │ HTTP API
-                            ↓
-┌────────────────────────────────────────────────────────────────┐
-│                新专家服务器 (每台)                                │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │           Expert Agent Gateway (EAG)                     │  │
-│  │  - Express 服务，监听 :3723 (可改)                        │  │
-│  │  - 接收 PMS 触发，调用本机 openclaw cron run              │  │
-│  │  - 鉴权：长期 token / bootstrap token                     │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                            │                                    │
-│                            ↓ execSync                           │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │              OpenClaw Gateway (默认安装)                   │  │
-│  │  - 监听 :12124 (OpenClaw 自带)                            │  │
-│  │  - 启动 Agent → 调 PMS API 写稿                          │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────┘
+                         主 PMS 服务器
+                  ┌────────────────────────────┐
+                  │   Football PMS (端口 3721)   │
+                  │   - 批次管理 / 发稿调度      │
+                  │   - 远程专家管理 (EAG 面板)  │
+                  └────────────┬───────────────┘
+                               │ HTTP (内网)
+              ┌────────────────┼────────────────┐
+              │                │                │
+   ┌──────────▼────────┐ ┌────▼─────┐ ┌────────▼────────┐
+   │  新专家服务器 A    │ │ 服务器 B │ │   新专家服务器 C  │
+   │  EAG (端口 1688)  │ │   ...    │ │  EAG (端口 1688) │
+   │  ┌──────────────┐ │ │          │ │  ┌──────────────┐│
+   │  │ OpenClaw +   │ │ │          │ │  │ OpenClaw +   ││
+   │  │ Agent 1-5    │ │ │          │ │  │ Agent 1-5    ││
+   │  └──────────────┘ │ │          │ │  └──────────────┘│
+   └───────────────────┘ └──────────┘ └─────────────────┘
 ```
-
-**职责划分**：
-
-| 组件 | 职责 | 部署位置 |
-|------|------|----------|
-| PMS | 批次管理、分配逻辑、数据库 | 主服务器 |
-| EAG | 触发队列、专家映射、调用 openclaw | 新专家服务器 |
-| OpenClaw | 实际执行 Agent | 新专家服务器（默认安装） |
-
----
 
 ## 二、新专家服务器部署步骤
 
 ### 步骤 1：安装 OpenClaw
 
-```bash
-# 安装 Node.js (v18+)
-curl -fsSL https://deb.nodesource.com/setup_18.x | sudo bash -
-sudo apt-get install -y nodejs
-
-# 全局安装 OpenClaw
-sudo npm install -g openclaw
-
-# 配置 OpenClaw 目录
-mkdir -p ~/.openclaw/{agents,cron,workspace,extensions}
-```
-
-启动 OpenClaw Gateway（默认监听 12124 端口）：
+按 OpenClaw 官方文档完成安装（默认配置即可）：
 
 ```bash
-HOME=/home/admin openclaw gateway &
-# 或注册为 systemd 服务
+# 示例（以官方实际安装方式为准）
+curl -fsSL https://openclaw.example.com/install.sh | bash
 ```
 
-### 步骤 2：部署 EAG 服务
+确认安装：
 
 ```bash
-# 克隆 EAG 仓库
-git clone https://github.com/rainy198810-cmyk/eag.git /home/admin/expert-agent-gateway
-cd /home/admin/expert-agent-gateway
-
-# 安装依赖
-npm install
-
-# 编辑配置
-cp config.json config.json.bak  # 备份
-nano config.json
+which openclaw   # 应输出 /usr/bin/openclaw 或 /usr/local/bin/openclaw
+openclaw --version
 ```
 
-**`config.json` 配置说明**：
+### 步骤 2-3：一键部署 EAG 服务
 
-```json
-{
-  "token": "",
-  "bootstrapToken": "your-bootstrap-secret",
-  "openclawHome": "/home/admin",
-  "openclawCronsPath": "/home/admin/.openclaw/cron/jobs.json",
-  "workspaceRoot": "/home/admin/.openclaw/workspace",
-  "asyncTimeoutMs": 15000,
-  "waitTimeoutMs": 600000,
-  "cronJobs": {}
-}
-```
+**前提**：新服务器已 root 登录（或具有 sudo 权限）。
 
-- `token`：长期 token，**首次部署时留空**，PMS 首次部署时会自动生成并写入
-- `bootstrapToken`：一次性 bootstrap 密钥，仅用于首次部署（防止长期 token 泄露）
-- `openclawHome`：openclaw 配置根目录
-- `openclawCronsPath`：cron jobs.json 完整路径
-- `workspaceRoot`：专家 workspace 父目录
-
-**Token 机制说明**：
-
-| 阶段 | 使用 Token | 谁生成 |
-|------|------------|--------|
-| EAG 首次部署 | `bootstrapToken` | 管理员在 EAG config.json 设置 |
-| 部署完成后续 | `token`（自动生成） | PMS 自动生成 32 字节熵 token 并写入 EAG |
-| 健康检查 | 无需鉴权 | - |
-
-**手动生成 bootstrapToken**（推荐）：
+直接执行（一行命令完成全部部署）：
 
 ```bash
-openssl rand -hex 16
-# 或
-node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"
+curl -fsSL https://raw.githubusercontent.com/rainy198810-cmyk/eag/main/install.sh | sudo bash
 ```
 
-### 步骤 3：启动 EAG 服务
+脚本会自动完成：
+1. 检查/安装 Node.js (≥18)
+2. 克隆 EAG 仓库到 `/home/admin/expert-agent-gateway`
+3. `npm install` 安装依赖
+4. 自动生成 bootstrapToken（首次部署）
+5. 写入 `config.json`（含 bootstrapToken）
+6. 创建 systemd 服务 `expert-agent-gateway.service`（端口 1688）
+7. 启动并验证服务
 
-**方式 A：直接运行（测试用）**
+**首次部署输出示例**：
+
+```
+[EAG-INSTALL] Node.js 18 已安装
+[EAG-INSTALL] 克隆 EAG 仓库到 /home/admin/expert-agent-gateway...
+[EAG-INSTALL] 首次部署，自动生成 bootstrapToken: a1b2c3d4e5f6...
+请保存此 bootstrapToken，PMS 部署专家时需要填写！
+[EAG-INSTALL] config.json 写入完成
+[EAG-INSTALL] ✓ EAG 服务已启动（端口 1688）
+{"ok":true,"service":"expert-agent-gateway","version":"1.0.0","experts":[],"needsBootstrap":true,"hasBootstrapToken":true}
+首次部署状态: needsBootstrap=true
+请在主 PMS 后台 → 远程专家部署 (EAG) 填写：
+  EAG URL:              http://10.0.0.5:1688
+  EAG Bootstrap Token:  a1b2c3d4e5f6...
+```
+
+**非交互模式**（CI / 批量部署）：
 
 ```bash
-EAG_PORT=3723 EAG_TOKEN=your-shared-secret node src/server.mjs
+EAG_BOOTSTRAP_TOKEN=my-secret curl -fsSL https://raw.githubusercontent.com/rainy198810-cmyk/eag/main/install.sh | sudo bash -s --
 ```
 
-**方式 B：systemd 服务（推荐生产）**
-
-创建 `/etc/systemd/system/expert-agent-gateway.service`：
-
-```ini
-[Unit]
-Description=Expert Agent Gateway
-After=network.target
-
-[Service]
-Type=simple
-User=admin
-WorkingDirectory=/home/admin/expert-agent-gateway
-ExecStart=/usr/bin/node src/server.mjs
-Restart=always
-Environment=NODE_ENV=production
-Environment=EAG_PORT=3723
-Environment=EAG_TOKEN=your-shared-secret
-
-[Install]
-WantedBy=multi-user.target
-```
-
-启动服务：
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable expert-agent-gateway
-sudo systemctl start expert-agent-gateway
-sudo systemctl status expert-agent-gateway
-```
+**重新运行**：脚本幂等，会自动 `git pull` 升级并保留现有 token。
 
 ### 步骤 4：验证 EAG
 
 ```bash
 # 健康检查（无需 token），确认 needsBootstrap 状态
-curl http://10.0.0.5:3723/api/health
+curl http://127.0.0.1:1688/api/health
 ```
 
 预期输出（首次部署，token 为空）：
@@ -179,32 +113,32 @@ curl http://10.0.0.5:3723/api/health
 
 部署成功一次后，`needsBootstrap` 变为 `false`，且 EAG 自动生成的 token 写入 config.json。
 
-### 步骤 5：开放防火墙端口
+### 步骤 5：开放防火墙
+
+确保主 PMS 服务器的 IP 能访问新专家服务器的 :1688 端口。
 
 ```bash
-sudo ufw allow from 10.0.0.0/24 to any port 3723
-# 或 iptables
-sudo iptables -A INPUT -p tcp --dport 3723 -s 10.0.0.0/24 -j ACCEPT
+# ufw
+sudo ufw allow from 10.0.0.0/24 to any port 1688
+
+# iptables
+sudo iptables -A INPUT -p tcp --dport 1688 -s 10.0.0.0/24 -j ACCEPT
 ```
-
-确保主 PMS 服务器的 IP 能访问新专家服务器的 :3723 端口。
-
----
 
 ## 三、主 PMS 服务器配置
 
 ### 步骤 1：登录 PMS 后台
 
-访问 `http://主PMS_IP:3721/`，进入「设置 → 远程专家部署 (EAG)」面板。
+打开浏览器，访问主 PMS：`http://10.0.0.1:3721/`
 
 ### 步骤 2：部署新专家
 
-填写表单：
+在 PMS 后台找到「**远程专家部署 (EAG)**」面板，填写表单：
 
 | 字段 | 必填 | 说明 | 示例 |
 |------|------|------|------|
 | 专家 ID | 是 | 专家唯一标识 | `newExpert1` |
-| EAG URL | 是 | EAG 服务地址 | `http://10.0.0.5:3723` |
+| EAG URL | 是 | EAG 服务地址 | `http://10.0.0.5:1688` |
 | EAG Bootstrap Token | **首次部署必填** | 与 EAG `config.json` 的 `bootstrapToken` 一致 | `my-bootstrap-secret` |
 | EAG Token | EAG 已设置 token 时必填 | 与 EAG `config.json` 的 `token` 一致（首次部署留空） | `（留空）` |
 | 飞书 Chat ID | 否 | 飞书通知群 | `oc_xxxxxx` |
@@ -245,82 +179,41 @@ sudo iptables -A INPUT -p tcp --dport 3723 -s 10.0.0.0/24 -j ACCEPT
 
 ### 步骤 4：启用专家
 
-部署完成后，还需要在 PMS 「**专家管理**」面板将新专家 ID 添加到 `enabledExperts` 列表：
-
-编辑 `config/experts.json`：
-
-```json
-{
-  "enabledExperts": [
-    "lvyindayingjia",
-    "newExpert1",
-    "newExpert2"
-  ]
-}
-```
-
-或在后台「专家管理」界面添加。
-
----
+部署完成后，在 PMS 后台「**专家配置**」面板把新专家 ID 加入 `enabledExperts` 列表，保存后即可在批次分配时被调度。
 
 ## 四、触发流程
 
-### 自动触发
+### 自动触发（推荐）
 
-1. PMS 分配批次给新专家
-2. PMS 调用 `agent-trigger.mjs`
-3. `runWriteCronJob` 检查 `data/expert-gateways.json`
-4. 命中 EAG 配置 → **HTTP POST** `EAG/api/trigger`
-5. EAG `execSync('openclaw cron run <jobId> --timeout ...')`
-6. OpenClaw 启动 agent
-7. Agent 读取 workspace 的 MD 文件
-8. Agent 调 `PMS_BASE_URL/api/v1/assignments/<expertId>` 拉取任务
-9. Agent 写稿 → POST `PMS_BASE_URL/api/v1/drafts/<batchId>` 提交
+批次分配时，PMS 会自动触发 EAG 调本机 OpenClaw agent：
+
+1. PMS 调 `POST EAG/api/trigger`（带 token + expertId + 任务数据）
+2. EAG 调本机 `openclaw cron run <jobId>`
+3. OpenClaw agent 调主 PMS `/api/v1/expert/draft` 拉取任务
+4. Agent 写稿后调 `/api/v1/expert/draft` 提交草稿
 
 ### 手动触发
 
-在 PMS 后台「发布任务详情」页面点击「**触发 Agent**」即可。
-
-### 查看日志
-
 ```bash
-# PMS 端
-journalctl -u football-publish-manager -f
-
-# EAG 端
-journalctl -u expert-agent-gateway -f
-# 或直接运行时
-node src/server.mjs  # 输出到 stdout
+curl -X POST http://127.0.0.1:1688/api/trigger \
+  -H "Authorization: Bearer $EAG_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"expertId": "newExpert1", "async": true}'
 ```
-
----
 
 ## 五、添加多个专家
 
-每台新专家服务器可运行 1 个 EAG 服务，承载任意数量的专家。
+- **单机多专家**：在同一台 EAG 服务器上部署多个 cron job，每个 expertId 对应一个 jobId
+- **多机部署**：每台机器执行同一 install.sh 即可
 
-### 单机多专家
-
-在主 PMS 后台 EAG 面板，**多次部署**填写不同的 `expertId`，但使用相同的 `EAG URL` 和 `Token`：
-
-```
-专家1：expertId=expertA, EAG=http://10.0.0.5:3723
-专家2：expertId=expertB, EAG=http://10.0.0.5:3723
-专家3：expertId=expertC, EAG=http://10.0.0.5:3723
-```
-
-每次部署都会在 EAG 配置中新增 `expertId → jobId` 映射。
-
-### 多机部署
-
-每台机器独立部署 EAG，配置不同的 `EAG URL`：
+示例：
 
 ```
-机器1: 3 个专家 → EAG=http://10.0.0.5:3723
-机器2: 2 个专家 → EAG=http://10.0.0.6:3723
+机器1: 3 个专家 → EAG=http://10.0.0.5:1688
+机器2: 2 个专家 → EAG=http://10.0.0.6:1688
 ```
 
----
+PMS 后台为每个专家分别填写不同的 expertId 和 EAG URL 即可。
 
 ## 六、常见问题
 
@@ -356,14 +249,19 @@ which openclaw
 
 EAG 用 `HOME` 环境变量定位 openclaw 配置目录。检查 `config.json` 的 `openclawHome` 是否正确。
 
-### Q4：需要卸载某个专家
+### Q4：如何卸载 EAG
 
-PMS 后台 EAG 面板 → 在「已配置的 EAG 专家」列表点击「**卸载**」。
+```bash
+sudo systemctl stop expert-agent-gateway
+sudo systemctl disable expert-agent-gateway
+sudo rm /etc/systemd/system/expert-agent-gateway.service
+sudo systemctl daemon-reload
 
-会删除：
-- EAG 配置中的 expertId 映射
-- OpenClaw jobs.json 中的 cron job
-- `data/expert-gateways.json` 中的记录
+# 删除 EAG 目录
+rm -rf /home/admin/expert-agent-gateway
+```
+
+然后在 PMS 后台删除对应 EAG 配置。
 
 ### Q5：EAG 配置变更后需要重启
 
@@ -385,9 +283,17 @@ sudo systemctl restart expert-agent-gateway
 
 > 注意：bootstrapToken 丢失不影响 EAG 正常运行，长期 token 仍然有效。
 
----
-
 ## 七、升级 EAG
+
+**方式 A：重跑 install.sh（推荐，自动备份配置）**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rainy198810-cmyk/eag/main/install.sh | sudo bash
+```
+
+脚本会自动 `git pull` 升级，并保留 `config.json`（含 token）。仅在 token 为空时才会重新生成 bootstrapToken。
+
+**方式 B：手动升级**
 
 ```bash
 cd /home/admin/expert-agent-gateway
@@ -408,8 +314,6 @@ sudo systemctl status expert-agent-gateway
 
 > 升级 EAG 时务必备份 `config.json`，否则会丢失已设置的长期 token（虽然可以重新通过 bootstrap 部署）。
 
----
-
 ## 八、安全建议
 
 1. **BootstrapToken 长度 ≥ 32 位**，使用 `openssl rand -hex 16` 生成
@@ -422,3 +326,19 @@ sudo systemctl status expert-agent-gateway
 6. **bootstrapToken 视为"秘密"**：仅管理员掌握，不要写入 git 或共享文档
 7. **升级 EAG 时保护 config.json**：升级前备份，升级后恢复（避免丢失 token）
 8. **OpenClaw jobs.json 备份**：升级 OpenClaw 前备份
+
+## 九、EAG API 端点参考
+
+| 方法 | 路径 | 鉴权 | 功能 |
+|------|------|------|------|
+| GET | `/api/health` | 无 | 健康检查 |
+| POST | `/api/trigger` | token | 触发专家 |
+| GET | `/api/experts` | token | 列出已部署专家 |
+| POST | `/api/admin/install-cron` | token / bootstrap | 安装 cron job |
+| POST | `/api/admin/install-files` | token | 推送 MD 文件 |
+| POST | `/api/admin/uninstall` | token | 卸载专家 |
+| GET | `/api/config/cron-jobs` | token | 查看 cron job 映射 |
+| PUT | `/api/config/cron-jobs` | token | 更新 cron job 映射 |
+| DELETE | `/api/config/cron-jobs/{expertId}` | token | 删除 cron job 映射 |
+
+**bootstrap 鉴权**（仅 `install-cron` 支持）：当 `needsBootstrap=true` 且 EAG config.json 包含 `bootstrapToken` 时，可使用 `Authorization: Bearer <bootstrapToken>` 完成首次安装，安装时可附带 `setToken` 字段设置长期 token。

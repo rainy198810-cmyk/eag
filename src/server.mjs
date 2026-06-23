@@ -29,7 +29,7 @@ function loadConfig() {
 }
 
 let config = loadConfig();
-const PORT = process.env.EAG_PORT || 3723;
+const PORT = process.env.EAG_PORT || 1688;
 
 function saveConfig() {
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
