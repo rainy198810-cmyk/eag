@@ -1,6 +1,6 @@
 import express from 'express';
 import { execSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -132,11 +132,21 @@ app.delete('/api/config/cron-jobs/:expertId', auth, (req, res) => {
   res.json({ ok: true, cronJobs: config.cronJobs });
 });
 
-// 安装 cron job 到 OpenClaw（追加到 jobs.json）
-app.post('/api/admin/install-cron', auth, (req, res) => {
+// 把毫秒转成 openclaw 的 --every 格式（10m / 1h / 30s / 500ms）
+function msToEveryDuration(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return '10m';
+  if (n % 3600000 === 0) return `${n / 3600000}h`;
+  if (n % 60000 === 0) return `${n / 60000}m`;
+  if (n % 1000 === 0) return `${n / 1000}s`;
+  return `${n}ms`;
+}
+
+// 安装 cron job 到 OpenClaw（使用 openclaw cron add CLI，而不是直接写 jobs.json）
+app.post('/api/admin/install-cron', auth, async (req, res) => {
   const { cronJob, setToken } = req.body || {};
-  if (!cronJob || !cronJob.id || !cronJob.name || !cronJob.agentId) {
-    return res.status(400).json({ ok: false, error: 'cronJob { id, name, agentId } required' });
+  if (!cronJob || !cronJob.name || !cronJob.agentId || !cronJob.payload?.message) {
+    return res.status(400).json({ ok: false, error: 'cronJob { name, agentId, payload.message } required' });
   }
 
   // 首次部署：使用 bootstrap 调用，可顺便设置长期 token
@@ -144,28 +154,78 @@ app.post('/api/admin/install-cron', auth, (req, res) => {
     config.token = String(setToken);
   }
 
-  const cronsPath = config.openclawCronsPath
-    || join(config.openclawHome || '/home/admin', '.openclaw', 'cron', 'jobs.json');
-
-  let data = { jobs: [] };
-  if (existsSync(cronsPath)) {
+  // 1. 若存在旧的同名/同 agentId 任务，先用 CLI 移除
+  const oldJobId = config.cronJobs?.[cronJob.agentId];
+  if (oldJobId) {
     try {
-      data = JSON.parse(readFileSync(cronsPath, 'utf-8'));
+      execSync(`openclaw cron rm "${oldJobId}"`, {
+        stdio: 'pipe',
+        env: { ...process.env, HOME: config.openclawHome || '/home/admin' }
+      });
     } catch (e) {
-      return res.status(500).json({ ok: false, error: `failed to parse ${cronsPath}: ${e.message}` });
+      // 旧 job 不存在，忽略
     }
   }
-  data.jobs = data.jobs || [];
-  // 移除同名（按 name）和同 id 的旧条目
-  data.jobs = data.jobs.filter(j => j.name !== cronJob.name && j.id !== cronJob.id);
-  data.jobs.push(cronJob);
-  writeFileSync(cronsPath, JSON.stringify(data, null, 2));
 
-  // 更新本机配置
-  config.cronJobs[cronJob.agentId] = cronJob.id;
+  // 2. 用 CLI 添加新 cron job
+  const schedule = cronJob.schedule || {};
+  const every = schedule.kind === 'every'
+    ? msToEveryDuration(schedule.everyMs)
+    : '10m';
+  const session = cronJob.sessionTarget || 'isolated';
+  const sessionKey = cronJob.sessionKey || `agent:${cronJob.agentId}:main`;
+  const enabledFlag = cronJob.enabled ? '' : '--disabled';
+  // delivery.mode: 'silent' / 'announce'
+  const deliverFlag = cronJob.delivery?.mode === 'announce' ? '--announce' : '--no-deliver';
+
+  const args = [
+    'openclaw', 'cron', 'add',
+    '--name', JSON.stringify(cronJob.name),
+    '--agent', JSON.stringify(cronJob.agentId),
+    '--message', JSON.stringify(cronJob.payload.message),
+    '--session', session,
+    '--session-key', JSON.stringify(sessionKey),
+    '--every', every,
+    '--json',
+  ];
+  if (enabledFlag) args.push(enabledFlag);
+  if (deliverFlag) args.push(deliverFlag);
+
+  let addOutput;
+  try {
+    addOutput = execSync(args.join(' '), {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, HOME: config.openclawHome || '/home/admin' }
+    }).toString();
+  } catch (e) {
+    const stderr = e.stderr?.toString() || e.message;
+    return res.status(500).json({ ok: false, error: `openclaw cron add 失败: ${stderr}` });
+  }
+
+  // 3. 解析 CLI 返回的 JSON，提取 openclaw 生成的 jobId
+  let addedJob;
+  try {
+    const jsonMatch = addOutput.match(/\{[\s\S]*\}/);
+    addedJob = JSON.parse(jsonMatch ? jsonMatch[0] : addOutput);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: `无法解析 openclaw cron add 输出: ${addOutput}` });
+  }
+  const newJobId = addedJob.id;
+  if (!newJobId) {
+    return res.status(500).json({ ok: false, error: `openclaw cron add 未返回 id: ${addOutput}` });
+  }
+
+  // 4. 更新本机配置
+  config.cronJobs = config.cronJobs || {};
+  config.cronJobs[cronJob.agentId] = newJobId;
   saveConfig();
 
-  res.json({ ok: true, jobId: cronJob.id, cronCount: data.jobs.length });
+  res.json({
+    ok: true,
+    jobId: newJobId,
+    expertId: cronJob.agentId,
+    cronCount: config.cronJobs ? Object.keys(config.cronJobs).length : 0,
+  });
 });
 
 // 安装 agent MD 文件到 workspace
@@ -190,38 +250,74 @@ app.post('/api/admin/install-files', auth, (req, res) => {
   res.json({ ok: true, expertId, filesWritten: written });
 });
 
-// 卸载：删除 cron job 和 workspace
+// 卸载：使用 openclaw cron rm 删除任务，删除 workspace
 app.post('/api/admin/uninstall', auth, (req, res) => {
-  const { expertId, cronsPath, workspaceRoot } = req.body || {};
+  const { expertId, workspaceRoot } = req.body || {};
   if (!expertId) return res.status(400).json({ ok: false, error: 'expertId required' });
 
+  // 1. 从本机 config 找到 jobId，调用 openclaw cron rm 删除
   const jobId = config.cronJobs?.[expertId];
-  const cpath = cronsPath || config.openclawCronsPath
-    || join(config.openclawHome || '/home/admin', '.openclaw', 'cron', 'jobs.json');
-
   let removedFromCrons = 0;
-  let targetJobName = `football-write-${expertId}`;
-  if (existsSync(cpath)) {
+  if (jobId) {
     try {
-      const data = JSON.parse(readFileSync(cpath, 'utf-8'));
-      const before = (data.jobs || []).length;
-      // 同时按 jobId 和 name 过滤（兼容 cronJobs 已被清空的情况）
-      data.jobs = (data.jobs || []).filter(j => {
-        if (jobId && j.id === jobId) return false;
-        if (j.name === targetJobName) return false;
-        return true;
+      execSync(`openclaw cron rm "${jobId}"`, {
+        stdio: 'pipe',
+        env: { ...process.env, HOME: config.openclawHome || '/home/admin' }
       });
-      removedFromCrons = before - data.jobs.length;
-      writeFileSync(cpath, JSON.stringify(data, null, 2));
+      removedFromCrons = 1;
     } catch (e) {
-      // 忽略
+      // job 不存在，忽略
     }
   }
 
-  delete config.cronJobs[expertId];
+  // 2. 兼容清理：openclaw 内部可能还有遗留的同 name 任务
+  // 通过 openclaw cron list --json 查找并删除同 name 的任务
+  try {
+    const listOutput = execSync('openclaw cron list --json', {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, HOME: config.openclawHome || '/home/admin' }
+    }).toString();
+    const jsonMatch = listOutput.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      const jobs = JSON.parse(jsonMatch[0]);
+      const targetName = `football-write-${expertId}`;
+      for (const j of jobs) {
+        if (j.name === targetName && j.id !== jobId) {
+          try {
+            execSync(`openclaw cron rm "${j.id}"`, {
+              stdio: 'pipe',
+              env: { ...process.env, HOME: config.openclawHome || '/home/admin' }
+            });
+            removedFromCrons += 1;
+          } catch (e) {
+            // 忽略
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // list 失败时忽略
+  }
+
+  // 3. 清理 workspace 目录
+  const wroot = workspaceRoot || config.workspaceRoot
+    || join(config.openclawHome || '/home/admin', '.openclaw', 'workspace');
+  let removedWorkspace = false;
+  try {
+    const ws = join(wroot, expertId);
+    if (existsSync(ws)) {
+      rmSync(ws, { recursive: true, force: true });
+      removedWorkspace = true;
+    }
+  } catch (e) {
+    // 忽略
+  }
+
+  // 4. 清理本机 config
+  if (config.cronJobs) delete config.cronJobs[expertId];
   saveConfig();
 
-  res.json({ ok: true, expertId, removedFromCrons, jobId });
+  res.json({ ok: true, expertId, removedFromCrons, removedWorkspace, jobId });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
