@@ -200,11 +200,17 @@ app.post('/api/admin/uninstall', auth, (req, res) => {
     || join(config.openclawHome || '/home/admin', '.openclaw', 'cron', 'jobs.json');
 
   let removedFromCrons = 0;
-  if (jobId && existsSync(cpath)) {
+  let targetJobName = `football-write-${expertId}`;
+  if (existsSync(cpath)) {
     try {
       const data = JSON.parse(readFileSync(cpath, 'utf-8'));
       const before = (data.jobs || []).length;
-      data.jobs = (data.jobs || []).filter(j => j.id !== jobId && j.name !== `football-write-${expertId}`);
+      // 同时按 jobId 和 name 过滤（兼容 cronJobs 已被清空的情况）
+      data.jobs = (data.jobs || []).filter(j => {
+        if (jobId && j.id === jobId) return false;
+        if (j.name === targetJobName) return false;
+        return true;
+      });
       removedFromCrons = before - data.jobs.length;
       writeFileSync(cpath, JSON.stringify(data, null, 2));
     } catch (e) {
